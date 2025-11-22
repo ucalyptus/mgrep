@@ -1,4 +1,5 @@
 import * as fs from "node:fs";
+import * as os from "node:os";
 import * as path from "node:path";
 import { Ollama } from "ollama";
 import { connect, type Connection, type Table } from "@lancedb/lancedb";
@@ -14,6 +15,8 @@ import type {
   StoreInfo,
 } from "./store";
 import type { SearchFilter } from "@mixedbread/sdk/resources/shared";
+
+const CHUNK_SIZE = 512; // Words per chunk
 
 interface Chunk {
   id: string; // unique chunk identifier: filepath:chunk_index
@@ -47,7 +50,7 @@ export class LocalStore implements Store {
   constructor(options?: { model?: string; ollamaHost?: string; dbPath?: string }) {
     this.model = options?.model || process.env.MXBAI_MODEL || "mxbai-embed-large";
     this.ollama = new Ollama({ host: options?.ollamaHost || process.env.OLLAMA_HOST || "http://127.0.0.1:11434" });
-    this.dbPath = options?.dbPath || process.env.MGREP_DB_PATH || path.join(process.env.HOME || "~", ".mgrep");
+    this.dbPath = options?.dbPath || process.env.MGREP_DB_PATH || path.join(os.homedir(), ".mgrep");
   }
 
   private async getConnection(): Promise<Connection> {
@@ -67,7 +70,7 @@ export class LocalStore implements Store {
     const tableName = `store_${storeId.replace(/[^a-zA-Z0-9_]/g, "_")}`;
 
     if (!tables.includes(tableName)) {
-      throw new Error(`Store '${storeId}' does not exist. Create it first with 'watch' command.`);
+      throw new Error(`Store '${storeId}' does not exist. Create it first using 'mgrep watch' or by creating a store explicitly.`);
     }
 
     return await conn.openTable(tableName);
@@ -83,22 +86,33 @@ export class LocalStore implements Store {
   }
 
   private async generateEmbedding(text: string): Promise<number[]> {
-    const response = await this.ollama.embeddings({
-      model: this.model,
-      prompt: text,
-    });
-    return response.embedding;
+    try {
+      const response = await this.ollama.embeddings({
+        model: this.model,
+        prompt: text,
+      });
+      return response.embedding;
+    } catch (error: unknown) {
+      const message = error instanceof Error ? error.message : String(error);
+      throw new Error(
+        `Failed to generate embedding. Ensure Ollama is running and model '${this.model}' is pulled. Original error: ${message}`
+      );
+    }
   }
 
-  private chunkText(text: string, chunkSize: number = 512): string[] {
-    const words = text.split(/\s+/);
-    const chunks: string[] = [];
+  private chunkText(text: string, chunkSize: number = CHUNK_SIZE): string[] {
+    const words = text.trim().split(/\s+/).filter(w => w.length > 0);
 
+    if (words.length === 0) {
+      return [];
+    }
+
+    const chunks: string[] = [];
     for (let i = 0; i < words.length; i += chunkSize) {
       chunks.push(words.slice(i, i + chunkSize).join(" "));
     }
 
-    return chunks.length > 0 ? chunks : [""];
+    return chunks;
   }
 
   async *listFiles(storeId: string): AsyncGenerator<StoreFile> {
@@ -159,25 +173,42 @@ export class LocalStore implements Store {
     const content = buffer.toString("utf-8");
     const textChunks = this.chunkText(content);
 
-    // Delete existing chunks for this file if overwriting
-    if (options.overwrite) {
-      await table.delete(`file_id = '${options.external_id}'`);
+    // Return early if no chunks to process
+    if (textChunks.length === 0) {
+      return;
     }
 
-    // Create embeddings for each chunk
-    const chunks: Chunk[] = [];
-    const lines = content.split("\n");
+    // Delete existing chunks for this file if overwriting
+    if (options.overwrite) {
+      // Escape single quotes to prevent SQL injection
+      const escapedId = options.external_id.replace(/'/g, "''");
+      await table.delete(`file_id = '${escapedId}'`);
+    }
 
+    // Generate all embeddings in parallel for better performance
+    const embeddingPromises = textChunks.map(chunkText => this.generateEmbedding(chunkText));
+    const vectors = await Promise.all(embeddingPromises);
+
+    // Calculate file metrics once
+    const lines = content.split("\n");
+    const estimatedWordsInFile = content.trim().split(/\s+/).filter(w => w.length > 0).length;
+
+    // Default metadata if not provided
+    const metadata: FileMetadata = options.metadata || {
+      path: options.external_id,
+      hash: "",
+    };
+
+    // Create chunks with embeddings
+    const chunks: Chunk[] = [];
     for (let i = 0; i < textChunks.length; i++) {
       const chunkText = textChunks[i];
-      const vector = await this.generateEmbedding(chunkText);
+      const vector = vectors[i];
 
       // Estimate line numbers for this chunk
-      const wordsPerChunk = 512;
-      const estimatedWordsInFile = content.split(/\s+/).length;
-      const startLine = Math.floor((i * wordsPerChunk / estimatedWordsInFile) * lines.length);
+      const startLine = Math.floor((i * CHUNK_SIZE / estimatedWordsInFile) * lines.length);
       const endLine = Math.min(
-        Math.floor(((i + 1) * wordsPerChunk / estimatedWordsInFile) * lines.length),
+        Math.floor(((i + 1) * CHUNK_SIZE / estimatedWordsInFile) * lines.length),
         lines.length
       );
 
@@ -187,28 +218,27 @@ export class LocalStore implements Store {
         chunk_index: i,
         text: chunkText,
         vector,
-        metadata: options.metadata as FileMetadata,
+        metadata,
         type: "text",
-        offset: i * wordsPerChunk,
+        offset: i * CHUNK_SIZE,
         generated_metadata: {
           start_line: startLine,
           num_lines: endLine - startLine,
-          word_count: chunkText.split(/\s+/).length,
+          word_count: chunkText.split(/\s+/).filter(w => w.length > 0).length,
           file_size: buffer.length,
         },
       });
     }
 
     // Add chunks to table
-    if (chunks.length > 0) {
-      await table.add(chunks);
-    }
+    await table.add(chunks);
   }
 
   async search(
     storeId: string,
     query: string,
     top_k?: number,
+    // Reranking is not currently supported in local mode
     _search_options?: { rerank?: boolean },
     filters?: SearchFilter,
   ): Promise<SearchResponse> {
@@ -224,7 +254,9 @@ export class LocalStore implements Store {
       for (const filter of filters.all) {
         if ("key" in filter && "operator" in filter && "value" in filter) {
           if (filter.key === "path" && filter.operator === "starts_with") {
-            queryBuilder = queryBuilder.where(`file_id LIKE '${filter.value}%'`);
+            // Escape single quotes to prevent SQL injection
+            const escapedValue = String(filter.value).replace(/'/g, "''");
+            queryBuilder = queryBuilder.where(`file_id LIKE '${escapedValue}%'`);
           }
         }
       }
@@ -245,7 +277,8 @@ export class LocalStore implements Store {
         num_lines: row.generated_metadata.num_lines,
       } : null,
       model: this.model,
-      score: 1 - (row._distance / 2), // Convert distance to similarity score
+      // Convert L2 distance to similarity score (range 0-1)
+      score: 1 / (1 + row._distance),
       file_id: row.file_id,
       filename: path.basename(row.file_id),
       store_id: storeId,
@@ -301,22 +334,37 @@ export class LocalStore implements Store {
     try {
       await this.getTable(storeId);
 
+      // Get actual timestamps from filesystem
+      const tableName = `store_${storeId.replace(/[^a-zA-Z0-9_]/g, "_")}`;
+      const tableDir = path.join(this.dbPath, tableName + ".lance");
+      let createdAt = new Date().toISOString();
+      let updatedAt = new Date().toISOString();
+
+      try {
+        const stats = await fs.promises.stat(tableDir);
+        createdAt = stats.birthtime.toISOString();
+        updatedAt = stats.mtime.toISOString();
+      } catch {
+        // If stat fails, use current time as fallback
+      }
+
       return {
         name: storeId,
         description: "",
-        created_at: new Date().toISOString(),
-        updated_at: new Date().toISOString(),
+        created_at: createdAt,
+        updated_at: updatedAt,
         counts: {
           pending: 0,
           in_progress: 0,
         },
       };
     } catch (_error) {
+      // Store doesn't exist - return empty timestamps
       return {
         name: storeId,
         description: "",
-        created_at: new Date().toISOString(),
-        updated_at: new Date().toISOString(),
+        created_at: "",
+        updated_at: "",
         counts: {
           pending: 0,
           in_progress: 0,
