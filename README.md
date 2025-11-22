@@ -59,8 +59,35 @@ mgrep "where do we set up auth?"
    ```
    Searches default to the current working directory unless you pass a path.
 
-**Today, `mgrep` works great on:** code, text, PDFs, images.  
+**Today, `mgrep` works great on:** code, text, PDFs, images.
 **Coming soon:** audio & video.
+
+## 🏠 Local Mode (Privacy First!)
+
+Want to keep everything on your machine? Use `mgrep` with **Ollama** for local embeddings and storage!
+
+```bash
+# Install Ollama
+brew install ollama  # or visit ollama.com
+
+# Pull an embedding model
+ollama pull mxbai-embed-large
+
+# Enable local mode
+export MGREP_LOCAL=true
+
+# Use mgrep normally - no API calls, complete privacy!
+mgrep watch
+mgrep "authentication middleware"
+```
+
+**Benefits:**
+- ✅ Complete privacy - data never leaves your machine
+- ✅ No API costs - 100% free
+- ✅ Works offline
+- ✅ Use any Ollama embedding model
+
+See [LOCAL_SETUP.md](LOCAL_SETUP.md) for detailed instructions and configuration options.
 
 ## Using it with Coding Agents
 
